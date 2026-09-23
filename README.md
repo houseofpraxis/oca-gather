@@ -1,4 +1,4 @@
-# oca-gather
+# Open-Chat-Archive format Gatherer
 
 Experimental local session collector for Linux amd64/arm64 and macOS amd64/arm64.
 
