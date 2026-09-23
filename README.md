@@ -114,6 +114,20 @@ attestation. This is a binary distribution repository; source development is
 currently private. The reviewed source commit for this release is recorded in
 [PROVENANCE.md](PROVENANCE.md).
 
+## Review what you collected
+
+After `collect`, a separate localhost binary serves the store without
+importing it:
+
+```sh
+oca-inspect serve --store "$STORE"
+```
+
+Download `oca-inspect` from
+[houseofpraxis/open-chat-archive](https://github.com/houseofpraxis/open-chat-archive/releases/tag/inspect-v0.1.0-experimental.1).
+It binds to `127.0.0.1` only. The page contains session text; do not publish
+it. This collector binary remains offline and does not serve traffic.
+
 ## Five-minute quick start
 
 ### 1. Confirm capabilities
