@@ -151,7 +151,16 @@ create a store.
 
 ### 3. Preview collection
 
-Choose a store whose parent directory already exists:
+Choose a store whose parent directory already exists — but **do not create the
+store directory yourself**. The collector creates the final directory itself
+(mode 0700, with its store marker inside) and refuses to adopt a plain
+pre-made directory, at any permissions. Pointing `--store` at a directory you
+created with `mkdir` fails closed with `STORE_UNTRUSTED`; remove the empty
+directory and rerun instead.
+
+The path must be absolute. Use `$HOME`, not a quoted `"~/..."` — quotes stop
+the shell from expanding `~`, so the collector receives a literal relative
+path and fails with `ARGUMENT_INVALID`.
 
 ```sh
 STORE="$HOME/oca-gather-store"
@@ -166,6 +175,11 @@ lock, object, or receipt.
 ```sh
 oca-gather collect --store "$STORE"
 ```
+
+The first real collect creates the store leaf itself. If it reports
+`STORE_UNTRUSTED` here, the target already exists without a valid store
+marker (for example, a pre-made empty directory) or its contents fail
+verification — the collector never adopts or repairs it.
 
 A repeat collection of the same adapter, origin, optional scope, and bytes is
 reported as unchanged rather than rewritten.
