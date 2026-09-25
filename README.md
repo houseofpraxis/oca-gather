@@ -184,6 +184,13 @@ verification — the collector never adopts or repairs it.
 A repeat collection of the same adapter, origin, optional scope, and bytes is
 reported as unchanged rather than rewritten.
 
+For a timer, use [`oca-gather-task`](oca-gather-task) instead of calling
+`collect` directly. Exit 8 is a real incomplete snapshot — often one session
+file still being written — and a timer that only checks the exit code will
+fail on every live client. The task retries those cases, settles when the
+stable files are already collected, and can ask `claude -p` about anything it
+still cannot classify. See [Scheduled collection](#scheduled-collection).
+
 ### 5. Verify the store
 
 ```sh
@@ -301,6 +308,38 @@ Exit `8` is intentionally not success. Review aggregate counts before deciding
 whether to retry with different limits or inspect `--details` in a protected
 environment. Already published verified objects are not rolled back merely
 because later durability confirmation was uncertain.
+
+## Scheduled collection
+
+`oca-gather` stays fail-closed. `oca-gather-task` is the operator wrapper for a
+repeated run. It does not weaken the collector. It retries and explains the
+exit-8 cases that otherwise fail a timer on every live session:
+
+- an empty pre-made store directory is removed and the collect is retried
+- a busy store lock is retried
+- unterminated or changing JSONL is retried; if the deferred count then stays
+  put and stable files were already collected, the task exits 0 with
+  `action: settled_live` (the snapshot is still incomplete — read `hint`)
+- `PUBLISHED_DURABILITY_UNCONFIRMED` is followed by `status`; a verified store
+  is not a task failure
+- overlap, corrupt objects, limit hits, and a non-empty foreign directory are
+  not repaired and are not sent to a model with paths or session bytes
+
+If the failure is still unclassified, and `claude` is on `PATH`, the task asks
+`claude -p` with tools disabled, plan mode, and only the aggregate JSON. Set
+`OCA_GATHER_ASK=never` to skip that. `auto` (the default) asks only for an
+unclassified failure. The advisor never receives `--details`, origin paths, or
+session text.
+
+```sh
+curl -fsSL -o "$HOME/.local/bin/oca-gather-task" \
+  https://raw.githubusercontent.com/houseofpraxis/oca-gather/main/oca-gather-task
+chmod 755 "$HOME/.local/bin/oca-gather-task"
+STORE="$HOME/oca-gather-store" oca-gather-task
+```
+
+Requires `python3`. The wrapper does not pass `--details` and does not delete a
+non-empty directory.
 
 Run the built-in reference for every flag and hard limit:
 

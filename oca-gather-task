@@ -1,0 +1,293 @@
+#!/bin/sh
+# Repeated oca-gather collect with recovery for the exit-8 cases that make a
+# timer fail while clients are still writing. Optionally asks claude -p about
+# an unclassified failure. Never passes --details, paths, or session bytes.
+set -eu
+
+ASK=${OCA_GATHER_ASK:-auto}
+RETRIES=${OCA_GATHER_RETRIES:-3}
+SLEEP_BASE=${OCA_GATHER_SLEEP:-2}
+BIN=${OCA_GATHER_BIN:-oca-gather}
+STORE=${STORE:-}
+
+usage() {
+	printf '%s\n' "oca-gather-task — retry and explain oca-gather collect
+
+Usage:
+  STORE=\$HOME/oca-gather-store oca-gather-task
+  oca-gather-task --store DIR
+
+The store path must be absolute. A leading ~/ is expanded. Do not pre-create
+the store directory; an empty pre-made directory is removed and retried.
+
+Exit 0 means the task policy is satisfied. It does not mean every live session
+file was snapshotted. Read task_ok and action in the JSON result.
+
+Environment:
+  OCA_GATHER_ASK      auto (default) | always | never
+                      auto asks claude -p only for an unclassified failure
+  OCA_GATHER_RETRIES  collect attempts (default 3)
+  OCA_GATHER_SLEEP    seconds before the first retry (default 2; tests use 0)
+  OCA_GATHER_BIN      collector binary (default oca-gather)
+
+claude -p runs with tools disabled, plan mode, no session persistence, and
+only the aggregate JSON. It cannot see --details or session files."
+}
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--store)
+		[ $# -ge 2 ] || { printf '%s\n' '{"operation":"gather-task","task_ok":false,"action":"argument_invalid"}'; exit 2; }
+		STORE=$2
+		shift 2
+		;;
+	--help|-h)
+		usage
+		exit 0
+		;;
+	*)
+		printf '%s\n' '{"operation":"gather-task","task_ok":false,"action":"argument_invalid"}'
+		exit 2
+		;;
+	esac
+done
+
+case $ASK in
+auto|always|never) ;;
+*)
+	printf '%s\n' '{"operation":"gather-task","task_ok":false,"action":"argument_invalid"}'
+	exit 2
+	;;
+esac
+
+case $STORE in
+"")
+	printf '%s\n' '{"operation":"gather-task","task_ok":false,"action":"store_missing","hint":"set STORE to an absolute path; do not quote a tilde"}'
+	exit 2
+	;;
+\~/*) STORE=$HOME/${STORE#\~/} ;;
+\~) STORE=$HOME ;;
+esac
+case $STORE in
+/*) ;;
+*)
+	printf '%s\n' '{"operation":"gather-task","task_ok":false,"action":"store_not_absolute","hint":"use $HOME/... inside quotes, not a relative path or a quoted tilde"}'
+	exit 2
+	;;
+esac
+
+removed=false
+if [ -d "$STORE" ] && [ ! -e "$STORE/.oca-gather-store" ]; then
+	if rmdir "$STORE" 2>/dev/null; then
+		removed=true
+	fi
+fi
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+classify() {
+	python3 -c '
+import json, sys
+req = json.load(sys.stdin)
+attempt = int(req.get("attempt") or 1)
+attempts = int(req.get("attempts") or 1)
+rc = int(req.get("exit") or 0)
+error = req.get("error") or ""
+col = req.get("collector") or {}
+counts = col.get("counts") or {}
+receipts = col.get("receipts") or {}
+deferred = int(counts.get("deferred") or 0)
+prev = req.get("previous_deferred")
+limit_hits = int(counts.get("limit_hits") or 0)
+published = int(receipts.get("new") or 0) + int(receipts.get("unchanged") or 0)
+live = error in ("PARTIAL_OR_DEFERRED", "SOURCE_UNTERMINATED_JSONL") or (rc == 8 and deferred and not error)
+
+def emit(action, task_ok, hint):
+    json.dump({"action": action, "task_ok": task_ok, "hint": hint}, sys.stdout)
+    sys.stdout.write("\n")
+
+if rc == 0:
+    emit("collected", True, "")
+elif rc == 6 or error == "STORE_BUSY":
+    if attempt < attempts:
+        emit("retry_busy", False, "store lock is held; retrying")
+    else:
+        emit("store_busy", False, "another collect or status still holds the store lock")
+elif rc == 2 or error == "ARGUMENT_INVALID":
+    emit("argument_invalid", False, "collector rejected an argument; the task already requires an absolute store path")
+elif error == "SOURCE_STORE_OVERLAP":
+    emit("source_store_overlap", False, "move the store so it is not inside or equal to a scanned source tree")
+elif error == "PUBLISHED_DURABILITY_UNCONFIRMED":
+    emit("check_status", False, "publication was not rolled back; verifying the store")
+elif error == "STORE_OBJECT_CORRUPT":
+    emit("store_corrupt", False, "preserve the store; do not delete it")
+elif error == "STORE_UNTRUSTED" or rc == 4:
+    emit("store_untrusted", False, "store is missing its marker, is not owner-only, or failed verification; an empty pre-made directory is removed automatically")
+elif limit_hits:
+    emit("limit_hit", False, "a configured budget was hit; raise the matching --max-* flag under its hard cap and rerun")
+elif live:
+    stable = prev is not None and int(prev) == deferred
+    if published > 0 and (stable or attempt >= attempts):
+        emit("settled_live", True, "stable files were collected; remaining deferrals are live or skipped sources, not a task failure")
+    elif attempt < attempts:
+        emit("retry_live", False, "some source files were still being written; retrying")
+    else:
+        emit("sources_busy", False, "matching files were still incomplete after retries; rerun when clients are idle")
+elif rc == 8:
+    emit("partial", False, "collect was partial; review aggregate counts before changing limits")
+else:
+    emit("unknown", False, "unclassified collector failure")
+'
+}
+
+json_get() {
+	python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
+}
+
+run_collect() {
+	set +e
+	"$BIN" collect --store "$STORE" >"$tmpdir/out" 2>"$tmpdir/err"
+	last_rc=$?
+	set -e
+	last_err=$(sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([A-Z0-9_]*\)".*/\1/p' "$tmpdir/err" | head -n 1)
+	if [ -s "$tmpdir/out" ]; then
+		last_out=$(cat "$tmpdir/out")
+	else
+		last_out='{}'
+	fi
+}
+
+prev_deferred=""
+attempt=0
+last_out='{}'
+last_err=""
+last_rc=1
+decision='{"action":"unknown","task_ok":false,"hint":""}'
+
+while [ "$attempt" -lt "$RETRIES" ]; do
+	attempt=$((attempt + 1))
+	run_collect
+	req=$(python3 -c 'import json,sys
+print(json.dumps({
+  "attempt": int(sys.argv[1]),
+  "attempts": int(sys.argv[2]),
+  "exit": int(sys.argv[3]),
+  "error": sys.argv[4],
+  "previous_deferred": None if sys.argv[5]=="" else int(sys.argv[5]),
+  "collector": json.loads(sys.argv[6]),
+}))' "$attempt" "$RETRIES" "$last_rc" "$last_err" "$prev_deferred" "$last_out")
+	decision=$(printf '%s' "$req" | classify)
+	action=$(printf '%s' "$decision" | json_get action)
+	prev_deferred=$(printf '%s' "$last_out" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    d={}
+print(int((d.get("counts") or {}).get("deferred") or 0))')
+	case $action in
+	retry_live|retry_busy)
+		if [ "$SLEEP_BASE" != 0 ]; then
+			sleep $((SLEEP_BASE * attempt))
+		fi
+		continue
+		;;
+	check_status)
+		set +e
+		"$BIN" status --store "$STORE" >"$tmpdir/status" 2>"$tmpdir/status.err"
+		status_rc=$?
+		set -e
+		if [ "$status_rc" -eq 0 ]; then
+			decision='{"action":"published_unconfirmed","task_ok":true,"hint":"objects were published; directory durability was not confirmed; status verified the store"}'
+		else
+			decision='{"action":"durability_unconfirmed","task_ok":false,"hint":"publication was not rolled back and status did not verify the store; preserve it"}'
+		fi
+		break
+		;;
+	*)
+		break
+		;;
+	esac
+done
+
+action=$(printf '%s' "$decision" | json_get action)
+task_ok=$(printf '%s' "$decision" | json_get task_ok)
+hint=$(printf '%s' "$decision" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("hint") or "")')
+
+payload=$(python3 -c 'import json,sys
+col=json.loads(sys.argv[1])
+col.pop("matches", None)
+col.pop("details", None)
+print(json.dumps({
+  "collector_exit": int(sys.argv[2]),
+  "collector_error": sys.argv[3],
+  "action": sys.argv[4],
+  "attempts": int(sys.argv[5]),
+  "collector": col,
+}))' "$last_out" "$last_rc" "$last_err" "$action" "$attempt")
+
+advice=""
+want_claude=false
+case $ASK in
+never) ;;
+always)
+	case $action in
+	collected|settled_live|published_unconfirmed) ;;
+	*) want_claude=true ;;
+	esac
+	;;
+auto)
+	case $action in
+	unknown|partial) want_claude=true ;;
+	esac
+	;;
+esac
+if [ "$want_claude" = true ] && command -v claude >/dev/null 2>&1; then
+	prompt="You are diagnosing an oca-gather collect task. You receive only privacy-safe aggregate JSON. Do not request paths, transcripts, account data, --details, or file contents. Do not suggest reading session directories. Reply in at most 6 lines: likely cause, then one next command that uses the placeholder \$STORE.
+JSON:
+$payload"
+	if command -v timeout >/dev/null 2>&1; then
+		claude_cmd="timeout 45 claude"
+	else
+		claude_cmd="claude"
+	fi
+	advice=$(
+		cd /tmp && $claude_cmd -p \
+			--tools "" \
+			--restricted \
+			--strict-mcp-config \
+			--permission-mode plan \
+			--permission-prompts none \
+			--max-turns 1 \
+			--no-session-persistence \
+			--output-format text \
+			"$prompt" 2>/dev/null || true
+	)
+	advice=$(printf '%s\n' "$advice" | awk 'NR<=8')
+fi
+
+python3 -c 'import json,sys
+base=json.loads(sys.argv[1])
+advice=sys.argv[2]
+if advice.strip():
+    base["advice"]=advice.strip()[:1200]
+print(json.dumps(base, sort_keys=True))
+' "$(python3 -c 'import json,sys
+print(json.dumps({
+  "operation":"gather-task",
+  "task_ok": sys.argv[1]=="True",
+  "action": sys.argv[2],
+  "hint": sys.argv[3],
+  "attempts": int(sys.argv[4]),
+  "removed_empty_store": sys.argv[5]=="true",
+  "collector_exit": int(sys.argv[6]),
+  "collector_error": sys.argv[7] or None,
+}))' "$task_ok" "$action" "$hint" "$attempt" "$removed" "$last_rc" "$last_err")" "$advice"
+
+if [ "$task_ok" = True ]; then
+	exit 0
+fi
+if [ "$last_rc" -eq 0 ]; then
+	exit 1
+fi
+exit "$last_rc"
