@@ -5,7 +5,7 @@
 set -eu
 # Never enable tracing.
 
-INSTALLER_VERSION=0.1.0-experimental.1
+INSTALLER_VERSION=0.1.0-experimental.2
 DEFAULT_REPO=houseofpraxis/oca-gather
 DEFAULT_BASE=https://github.com/${DEFAULT_REPO}/releases
 
@@ -21,9 +21,10 @@ Usage:
   sh install.sh --help
 
 Default download uses GitHub /releases/latest/download/, which skips prereleases.
-This experimental line is published as a prerelease; pin the tag:
+This experimental line is published as a prerelease; pin the binary tag.
+Use the main installer so oca-gather-task is installed too:
 
-  curl -fsSL -o install.sh https://raw.githubusercontent.com/${DEFAULT_REPO}/v0.1.0-experimental.1/install.sh
+  curl -fsSL -o install.sh https://raw.githubusercontent.com/${DEFAULT_REPO}/main/install.sh
   sh install.sh --version v0.1.0-experimental.1
 
 A pipe cannot fail the shell when curl fails:
@@ -43,9 +44,12 @@ Options / environment:
 Checksums from the same release detect download integrity/mismatch. They are
 not independent publisher authentication. This script does not call gh.
 
-No sudo. No shell profile edits. Uninstall:
-  rm -f DIR/oca-gather
-An existing regular file named oca-gather in DIR is replaced atomically.
+No sudo. No shell profile edits. Also installs oca-gather-task beside the
+binary. Uninstall:
+  rm -f DIR/oca-gather DIR/oca-gather-task
+An existing regular file named oca-gather or oca-gather-task in DIR is
+replaced atomically. The task script is checked against a fixed SHA-256 in
+this installer; that detects mismatch, not a publisher signature.
 "
 }
 
@@ -340,11 +344,49 @@ if ! mv -f "$tmp" "$dest"; then
 	exit 1
 fi
 
+task_repo=${repo:-$DEFAULT_REPO}
+task_url=${OCA_GATHER_TASK_URL:-https://raw.githubusercontent.com/${task_repo}/main/oca-gather-task}
+if ! curl -fsSL -o "$work/oca-gather-task" "$task_url"; then
+	printf '%s\n' "install.sh: download failed (oca-gather-task)" >&2
+	exit 1
+fi
+task_hash=ccb89309b5b127b8b1dd94bb5080dc76236d77044abc919517447e8d772a6989
+if [ "$hash_cmd" = sha256sum ]; then
+	got_task=$(sha256sum "$work/oca-gather-task" | awk '{print $1}')
+else
+	got_task=$(shasum -a 256 "$work/oca-gather-task" | awk '{print $1}')
+fi
+[ "$got_task" = "$task_hash" ] || die "oca-gather-task checksum mismatch"
+[ -f "$work/oca-gather-task" ] || die "missing oca-gather-task"
+[ ! -L "$work/oca-gather-task" ] || die "oca-gather-task is a symlink"
+task_dest=$install_dir/oca-gather-task
+if [ -L "$task_dest" ]; then
+	die "refusing to replace symlink $task_dest"
+fi
+if [ -d "$task_dest" ] || { [ -e "$task_dest" ] && [ ! -f "$task_dest" ]; }; then
+	die "refusing to replace non-regular $task_dest"
+fi
+task_tmp=$install_dir/.oca-gather-task.tmp.$$
+if ! cp "$work/oca-gather-task" "$task_tmp"; then
+	rm -f "$task_tmp"
+	die "cannot write $task_tmp (no sudo)"
+fi
+if ! chmod 0755 "$task_tmp"; then
+	rm -f "$task_tmp"
+	die "cannot chmod $task_tmp"
+fi
+if ! mv -f "$task_tmp" "$task_dest"; then
+	rm -f "$task_tmp"
+	printf '%s\n' "install.sh: atomic replace failed; previous task script left in place" >&2
+	exit 1
+fi
+
 printf '%s\n' "installed $dest"
+printf '%s\n' "installed $task_dest"
 case ":${PATH-}:" in
 *":${install_dir}:"*) ;;
 *)
 	printf '%s\n' "note: $install_dir is not in PATH"
 	;;
 esac
-printf '%s\n' "uninstall: rm -f $dest"
+printf '%s\n' "uninstall: rm -f $dest $task_dest"

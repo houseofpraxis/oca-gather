@@ -87,7 +87,7 @@ release:
 
 ```sh
 curl -fsSL -o install.sh \
-  https://raw.githubusercontent.com/houseofpraxis/oca-gather/v0.1.0-experimental.1/install.sh
+  https://raw.githubusercontent.com/houseofpraxis/oca-gather/main/install.sh
 sh install.sh --version v0.1.0-experimental.1
 ```
 
@@ -97,11 +97,13 @@ The installer:
 - downloads into a temporary directory;
 - verifies the archive against `checksums.txt`;
 - validates the flat archive member allowlist;
+- installs `oca-gather-task` beside the binary after checking its fixed SHA-256;
 - refuses a symlink or non-regular destination;
-- atomically replaces an existing regular binary; and
+- atomically replaces an existing regular binary or task script; and
 - never uses `sudo` or edits shell profiles.
 
-Default installation is `$HOME/.local/bin/oca-gather`. If it is not in `PATH`:
+Default installation is `$HOME/.local/bin/oca-gather` and
+`$HOME/.local/bin/oca-gather-task`. If that directory is not in `PATH`:
 
 ```sh
 $HOME/.local/bin/oca-gather --version
@@ -331,10 +333,10 @@ If the failure is still unclassified, and `claude` is on `PATH`, the task asks
 unclassified failure. The advisor never receives `--details`, origin paths, or
 session text.
 
+Re-run the installer above; it installs `oca-gather-task` next to `oca-gather`.
+Then point the timer at the task, not at raw `collect`:
+
 ```sh
-curl -fsSL -o "$HOME/.local/bin/oca-gather-task" \
-  https://raw.githubusercontent.com/houseofpraxis/oca-gather/main/oca-gather-task
-chmod 755 "$HOME/.local/bin/oca-gather-task"
 STORE="$HOME/oca-gather-store" oca-gather-task
 ```
 
@@ -366,7 +368,7 @@ oca-gather --help
 ## Uninstall
 
 ```sh
-rm -f "$HOME/.local/bin/oca-gather"
+rm -f "$HOME/.local/bin/oca-gather" "$HOME/.local/bin/oca-gather-task"
 ```
 
 Uninstalling the executable does not remove collection stores. Delete a store
